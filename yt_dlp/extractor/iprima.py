@@ -1,13 +1,13 @@
+import json
 import re
 import time
 
 from .common import InfoExtractor
 from ..utils import (
+    ExtractorError,
     determine_ext,
     js_to_json,
-    urlencode_postdata,
-    ExtractorError,
-    parse_qs
+    traverse_obj,
 )
 
 
@@ -15,8 +15,6 @@ class IPrimaIE(InfoExtractor):
     _VALID_URL = r'https?://(?!cnn)(?:[^/]+)\.iprima\.cz/(?:[^/]+/)*(?P<id>[^/?#&]+)'
     _GEO_BYPASS = False
     _NETRC_MACHINE = 'iprima'
-    _LOGIN_URL = 'https://auth.iprima.cz/oauth2/login'
-    _TOKEN_URL = 'https://auth.iprima.cz/oauth2/token'
     access_token = None
 
     _TESTS = [{
@@ -25,9 +23,29 @@ class IPrimaIE(InfoExtractor):
             'id': 'p51388',
             'ext': 'mp4',
             'title': 'Partička (92)',
-            'description': 'md5:859d53beae4609e6dd7796413f1b6cac',
-            'upload_date': '20201103',
-            'timestamp': 1604437480,
+            'description': 'md5:57943f6a50d6188288c3a579d2fd5f01',
+            'episode': 'Partička (92)',
+            'season': 'Partička',
+            'series': 'Prima Partička',
+            'episode_number': 92,
+            'thumbnail': 'https://d31b9s05ygj54s.cloudfront.net/prima-plus/image/video-ef6cf9de-c980-4443-92e4-17fe8bccd45c-16x9.jpeg',
+        },
+        'params': {
+            'skip_download': True,  # m3u8 download
+        },
+    }, {
+        'url': 'https://zoom.iprima.cz/porady/krasy-kanarskych-ostrovu/tenerife-v-risi-ohne',
+        'info_dict': {
+            'id': 'p1412199',
+            'ext': 'mp4',
+            'episode_number': 3,
+            'episode': 'Tenerife: V říši ohně',
+            'description': 'md5:4b4a05c574b5eaef130e68d4811c3f2c',
+            'duration': 3111.0,
+            'thumbnail': 'https://d31b9s05ygj54s.cloudfront.net/prima-plus/image/video-f66dd7fb-c1a0-47d1-b3bc-7db328d566c5-16x9-1711636518.jpg/t_16x9_medium_1366_768',
+            'title': 'Tenerife: V říši ohně',
+            'timestamp': 1711825800,
+            'upload_date': '20240330',
         },
         'params': {
             'skip_download': True,  # m3u8 download
@@ -66,39 +84,18 @@ class IPrimaIE(InfoExtractor):
         if self.access_token:
             return
 
-        login_page = self._download_webpage(
-            self._LOGIN_URL, None, note='Downloading login page',
-            errnote='Downloading login page failed')
-
-        login_form = self._hidden_inputs(login_page)
-
-        login_form.update({
-            '_email': username,
-            '_password': password})
-
-        _, login_handle = self._download_webpage_handle(
-            self._LOGIN_URL, None, data=urlencode_postdata(login_form),
-            note='Logging in')
-
-        code = parse_qs(login_handle.geturl()).get('code')[0]
-        if not code:
-            raise ExtractorError('Login failed', expected=True)
-
-        token_request_data = {
-            'scope': 'openid+email+profile+phone+address+offline_access',
-            'client_id': 'prima_sso',
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': 'https://auth.iprima.cz/sso/auth-check'}
-
         token_data = self._download_json(
-            self._TOKEN_URL, None,
-            note='Downloading token', errnote='Downloading token failed',
-            data=urlencode_postdata(token_request_data))
+            'https://ucet.iprima.cz/api/session/create', None,
+            note='Logging in', errnote='Failed to log in',
+            data=json.dumps({
+                'email': username,
+                'password': password,
+                'deviceName': 'Windows Chrome',
+            }).encode(), headers={'content-type': 'application/json'})
 
-        self.access_token = token_data.get('access_token')
-        if self.access_token is None:
-            raise ExtractorError('Getting token failed', expected=True)
+        self.access_token = token_data['accessToken']['value']
+        if not self.access_token:
+            raise ExtractorError('Failed to fetch access token')
 
     def _real_initialize(self):
         if not self.access_token:
@@ -115,14 +112,30 @@ class IPrimaIE(InfoExtractor):
 
         webpage = self._download_webpage(url, video_id)
 
-        title = self._html_search_meta(
+        title = self._html_extract_title(webpage) or self._html_search_meta(
             ['og:title', 'twitter:title'],
             webpage, 'title', default=None)
 
         video_id = self._search_regex((
             r'productId\s*=\s*([\'"])(?P<id>p\d+)\1',
-            r'pproduct_id\s*=\s*([\'"])(?P<id>p\d+)\1'),
-            webpage, 'real id', group='id')
+            r'pproduct_id\s*=\s*([\'"])(?P<id>p\d+)\1',
+            r'let\s+videos\s*=\s*([\'"])(?P<id>p\d+)\1',
+        ), webpage, 'real id', group='id', default=None)
+
+        if not video_id:
+            nuxt_data = self._search_nuxt_data(webpage, video_id, traverse='data', fatal=False)
+            video_id = traverse_obj(
+                nuxt_data, (..., 'content', 'additionals', 'videoPlayId', {str}), get_all=False)
+
+        if not video_id:
+            nuxt_data = self._search_json(
+                r'<script[^>]+\bid=["\']__NUXT_DATA__["\'][^>]*>',
+                webpage, 'nuxt data', None, end_pattern=r'</script>', contains_pattern=r'\[(?s:.+)\]')
+
+            video_id = traverse_obj(nuxt_data, lambda _, v: re.fullmatch(r'p\d+', v), get_all=False)
+
+        if not video_id:
+            self.raise_no_formats('Unable to extract video ID from webpage')
 
         metadata = self._download_json(
             f'https://api.play-backend.iprima.cz/api/v1//products/id-{video_id}/play',
@@ -152,7 +165,7 @@ class IPrimaIE(InfoExtractor):
         final_result = self._search_json_ld(webpage, video_id, default={})
         final_result.update({
             'id': video_id,
-            'title': title,
+            'title': final_result.get('title') or title,
             'thumbnail': self._html_search_meta(
                 ['thumbnail', 'og:image', 'twitter:image'],
                 webpage, 'thumbnail', default=None),
@@ -176,8 +189,8 @@ class IPrimaCNNIE(InfoExtractor):
             'title': 'md5:277c6b1ed0577e51b40ddd35602ff43e',
         },
         'params': {
-            'skip_download': 'm3u8'
-        }
+            'skip_download': 'm3u8',
+        },
     }]
 
     def _real_extract(self, url):
